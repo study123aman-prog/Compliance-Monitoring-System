@@ -1,0 +1,11 @@
+# Multi-Agent Compliance Monitoring System — reference implementation
+#
+# The runnable demo and the core library use the Python STANDARD LIBRARY ONLY
+# (hashlib, hmac, json, dataclasses, enum, datetime, typing). There are no
+# third-party runtime dependencies. This is deliberate: it keeps the reference
+# implementation auditable, portable, and easy to defend line-by-line.
+#
+# Requires Python 3.10+ (uses `X | None` type syntax and match-free structural code).
+#
+# The only optional dependency is the test runner, used for `pytest -q`:
+pytest>=7.0

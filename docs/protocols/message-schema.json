@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meridianbank.example/schemas/inter-agent-message/1.0.0",
+  "title": "Inter-Agent Message Envelope",
+  "description": "Canonical envelope for every message exchanged between compliance agents. Implements Appendix B of the project specification. The envelope is transport-agnostic (Kafka in production, in-memory bus in the reference implementation). Payload structure is selected by 'payload_schema' and validated against the matching definition in $defs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "message_id",
+    "protocol_version",
+    "timestamp",
+    "sender_agent_id",
+    "recipient_agent_id",
+    "message_type",
+    "priority",
+    "trace_id",
+    "payload_schema",
+    "payload",
+    "ttl_seconds",
+    "retry_count",
+    "audit_classification",
+    "sender_signature",
+    "nonce"
+  ],
+  "properties": {
+    "message_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Globally unique message identifier (UUID v4)."
+    },
+    "protocol_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semantic version of the message protocol, e.g. 1.0.0."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC creation time with millisecond precision, e.g. 2026-08-21T09:15:03.412Z."
+    },
+    "sender_agent_id": {
+      "type": "string",
+      "description": "Canonical AgentID of the sender, e.g. agent.transaction_monitor.",
+      "enum": [
+        "agent.orchestrator",
+        "agent.transaction_monitor",
+        "agent.communication_scanner",
+        "agent.regulatory_tracker",
+        "agent.report_generator",
+        "service.consensus_engine",
+        "service.escalation_manager",
+        "service.audit_ledger"
+      ]
+    },
+    "recipient_agent_id": {
+      "description": "Single AgentID or array of AgentIDs (multicast).",
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+      ]
+    },
+    "message_type": {
+      "type": "string",
+      "enum": ["ALERT", "QUERY", "RESPONSE", "UPDATE", "HEARTBEAT", "ESCALATION"],
+      "description": "Message intent."
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5,
+      "description": "Transport QoS. 1=CRITICAL, 2=HIGH, 3=MEDIUM, 4=LOW, 5=INFORMATIONAL."
+    },
+    "correlation_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "CONDITIONAL. Links all messages belonging to one compliance case/conversation. Required for any message that is part of a case (ALERT, QUERY, RESPONSE, ESCALATION); omitted for standalone HEARTBEATs."
+    },
+    "trace_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Distributed-tracing id (OpenTelemetry) for observability across hops."
+    },
+    "payload_schema": {
+      "type": "string",
+      "description": "Identifier selecting the payload structure, e.g. alert.insider-trading.v1, escalation.case.v1.",
+      "pattern": "^[a-z]+\\.[a-z0-9\\-]+\\.v\\d+$"
+    },
+    "payload": {
+      "type": "object",
+      "description": "Message-type-specific content. Validated against the definition named by payload_schema."
+    },
+    "confidence_score": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "CONDITIONAL. Required on ALERT and RESPONSE messages carrying a detection assessment; omitted on HEARTBEAT."
+    },
+    "ttl_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Time-to-live; message is considered expired after this many seconds (replay/staleness guard)."
+    },
+    "retry_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Delivery attempt counter (0 on first send)."
+    },
+    "audit_classification": {
+      "type": "string",
+      "enum": ["REGULATORY", "OPERATIONAL", "DIAGNOSTIC"],
+      "description": "Determines retention tier (see docs/observability/retention-policy.md)."
+    },
+    "sender_signature": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "ECDSA P-256 (or RSA-2048) signature over the canonical hash of envelope+payload. Provides authenticity + non-repudiation."
+    },
+    "nonce": {
+      "type": "string",
+      "minLength": 16,
+      "description": "One-time value for replay prevention."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "message_type": { "const": "ALERT" } } },
+      "then": { "required": ["correlation_id", "confidence_score"] }
+    },
+    {
+      "if": { "properties": { "message_type": { "const": "ESCALATION" } } },
+      "then": { "required": ["correlation_id"] }
+    }
+  ],
+  "$defs": {
+    "alert.detection.v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scenario_ref", "violation_type", "severity", "detecting_agent", "evidence", "regulations"],
+      "properties": {
+        "scenario_ref": { "type": "string", "description": "e.g. CS-01 (optional linkage to a known scenario type)." },
+        "violation_type": { "type": "string", "examples": ["insider_trading", "spoofing", "structuring", "sanctions_exposure"] },
+        "severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NO_ALERT"] },
+        "detecting_agent": { "type": "string" },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type", "reference", "description"],
+            "properties": {
+              "type": { "type": "string", "examples": ["transaction", "email", "reg_update", "metadata"] },
+              "reference": { "type": "string", "description": "Pointer to source record (id/hash), not raw sensitive data." },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "regulations": { "type": "array", "items": { "type": "string" }, "description": "Applicable regulatory citations." },
+        "recommended_action": { "type": "string" }
+      }
+    },
+    "query.corroboration.v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question", "entities", "window"],
+      "properties": {
+        "question": { "type": "string", "description": "e.g. 'Any comms linking accounts A and B in last 14d?'" },
+        "entities": { "type": "array", "items": { "type": "string" } },
+        "window": { "type": "string", "description": "Time window for the corroboration search." }
+      }
+    },
+    "response.corroboration.v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["found", "summary"],
+      "properties": {
+        "found": { "type": "boolean" },
+        "summary": { "type": "string" },
+        "evidence": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "escalation.case.v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["case_id", "tier", "severity", "sla_acknowledge_by", "decision_support"],
+      "properties": {
+        "case_id": { "type": "string" },
+        "tier": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
+        "sla_acknowledge_by": { "type": "string", "format": "date-time" },
+        "sla_resolve_by": { "type": "string", "format": "date-time" },
+        "decision_support": {
+          "type": "object",
+          "description": "Everything a human needs to decide without hunting: summary, evidence bundle, agent assessments, consensus result, applicable regs, recommended action, and confidence.",
+          "required": ["summary", "agent_assessments", "consensus_result", "recommended_action"],
+          "properties": {
+            "summary": { "type": "string" },
+            "agent_assessments": { "type": "array", "items": { "type": "object" } },
+            "consensus_result": { "type": "object" },
+            "recommended_action": { "type": "string" }
+          }
+        }
+      }
+    },
+    "update.regulatory.v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jurisdiction", "instrument", "effective_date", "impact"],
+      "properties": {
+        "jurisdiction": { "type": "string" },
+        "instrument": { "type": "string", "description": "Regulation / rule identifier." },
+        "effective_date": { "type": "string", "format": "date" },
+        "impact": { "type": "string", "enum": ["none", "recalibrate", "new_rule", "conflict"] },
+        "deadlines": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "heartbeat.status.v1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "queue_depth", "latency_ms"],
+      "properties": {
+        "status": { "type": "string", "enum": ["RUNNING", "DEGRADED", "STOPPED"] },
+        "queue_depth": { "type": "integer", "minimum": 0 },
+        "latency_ms": {
+          "type": "object",
+          "properties": { "p50": { "type": "number" }, "p95": { "type": "number" }, "p99": { "type": "number" } }
+        }
+      }
+    }
+  }
+}
