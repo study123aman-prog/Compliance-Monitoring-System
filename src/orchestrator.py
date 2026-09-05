@@ -19,6 +19,7 @@ from .agents.report_generator import ReportGenerator
 from .agents.transaction_monitor import TransactionMonitor
 from .audit_ledger import AuditLedger
 from .consensus import ConsensusEngine, ConsensusResult, Opinion
+from .detection import HITLQueue, ReviewItem
 from .domain import (
     AGENT_ORCH,
     AuditClass,
@@ -26,6 +27,7 @@ from .domain import (
     Severity,
     SVC_CONSENSUS,
     SVC_ESCALATION,
+    SVC_HITL,
 )
 from .escalation import EscalationManager, EscalationResult
 from .message_bus import MessageBus
@@ -39,6 +41,9 @@ class CaseOutcome:
     consensus: ConsensusResult
     escalation: EscalationResult
     opinions: list[Opinion]
+    #: the human-review routing decision (None => auto-cleared or auto-passed, i.e.
+    #: no human needed). Populated by the HITL router (detection stage 4).
+    review: ReviewItem | None = None
 
 
 class Orchestrator:
@@ -50,6 +55,8 @@ class Orchestrator:
         self.audit = AuditLedger()
         self.consensus = ConsensusEngine()
         self.escalation = EscalationManager()
+        #: human-review queue (accumulates across cases so the run has one queue).
+        self.hitl = HITLQueue()
 
         # The four specialist agents.
         self.tm = TransactionMonitor(self.bus)
@@ -78,6 +85,18 @@ class Orchestrator:
                      "domain": op.domain.value, "benign": op.benign},
                     AuditClass.REGULATORY,
                 )
+                # If this opinion was COMPUTED by the two-tier detection core
+                # (rather than a pre-set spec), record its structured verdict and
+                # full Chain-of-Thought so the score is reconstructable from the
+                # audit trail alone (SEC 17a-4 explainability / reproducibility).
+                if op.verdict:
+                    self.audit.append(
+                        cid, agent.agent_id, "detection.evaluated",
+                        {"verdict": op.verdict, "risk_score": op.risk_score,
+                         "severity": op.severity.name, "confidence": op.confidence,
+                         "rationale": list(op.rationale)},
+                        AuditClass.REGULATORY,
+                    )
 
         # 1b) Attach any explicit benign VERIFICATIONS (e.g. an authenticated
         #     approval record). These are not surveillance votes; they commit mass
@@ -116,10 +135,31 @@ class Orchestrator:
                            "unresolved": er.unresolved, "triggers": er.triggers},
                           AuditClass.REGULATORY)
 
+        # 3b) Human-in-the-Loop routing (detection stage 4): send high-risk or
+        #     low-confidence cases to the right human queue; auto-clear a
+        #     verified false positive; auto-pass a genuinely low-risk case. Every
+        #     outcome is written to the audit trail (routing is never a silent drop).
+        review = self.hitl.route(cid, cr, er, opinions=opinions)
+        if review is not None:
+            self.audit.append(cid, SVC_HITL, "hitl.enqueued",
+                              {"queue": review.queue, "priority": review.priority,
+                               "tier": review.tier, "severity": review.severity,
+                               "confidence": review.confidence, "reasons": review.reasons,
+                               "sla_ack_minutes": review.sla_ack_minutes,
+                               "sla_resolve": review.sla_resolve},
+                              AuditClass.REGULATORY)
+        else:
+            disposition = "auto_cleared_suppressed" if cr.suppressed else "auto_passed_low_risk"
+            self.audit.append(cid, SVC_HITL, "hitl.auto_disposition",
+                              {"disposition": disposition, "severity": cr.severity.name,
+                               "confidence": cr.confidence},
+                              AuditClass.REGULATORY)
+
         # 4) Report (RG assembles the package; it does not vote).
         self.rg.build_report(case, cr, er)
         self.audit.append(cid, self.rg.agent_id, "report.generated",
                           {"disposition": "SUPPRESSED" if cr.suppressed else cr.severity.name},
                           AuditClass.REGULATORY)
 
-        return CaseOutcome(case_id=cid, consensus=cr, escalation=er, opinions=opinions)
+        return CaseOutcome(case_id=cid, consensus=cr, escalation=er,
+                           opinions=opinions, review=review)

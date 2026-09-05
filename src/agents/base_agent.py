@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..consensus import Opinion
+from ..detection import DetectionPipeline, DEFAULT_PIPELINE
 from ..domain import AuditClass, MessageType, PRIORITY, Severity
 from ..envelope import Message
 from ..message_bus import MessageBus
@@ -18,20 +19,60 @@ class BaseAgent:
     #: human-readable list of the compliance domains this agent is authoritative in
     covered_domains: tuple[str, ...] = ()
 
-    def __init__(self, agent_id: str, bus: MessageBus) -> None:
+    def __init__(self, agent_id: str, bus: MessageBus,
+                 pipeline: DetectionPipeline | None = None) -> None:
         self.agent_id = agent_id
         self.bus = bus
+        #: the two-tier detection core used to COMPUTE opinions from raw signals.
+        self.pipeline = pipeline or DEFAULT_PIPELINE
 
     # -- detection -------------------------------------------------------- #
     def assess(self, case: dict[str, Any]) -> list[Opinion]:
         """Return this agent's opinion(s) on a case.
 
-        The scenario data maps agent_id -> opinion spec; we surface ours (if any).
+        Two paths:
+          1. COMPUTED — if the case carries a raw `signals[agent_id]` block, the
+             agent runs it through the detection pipeline (normalize -> guardrails
+             -> evaluator) and forms its opinion from what it actually finds. This
+             is the real detection path.
+          2. FALLBACK — if only a pre-set `opinions[agent_id]` spec is present
+             (no raw signal), that spec is surfaced verbatim. This keeps older
+             cases and unit fixtures working unchanged.
+
         Report Generator overrides this to return nothing (it does not vote).
         """
 
-        specs = case.get("opinions", {})
-        spec = specs.get(self.agent_id)
+        signal = case.get("signals", {}).get(self.agent_id)
+        if signal is not None:
+            return [self._computed_opinion(case, signal)]
+        return self._preset_opinion(case)
+
+    def _computed_opinion(self, case: dict[str, Any], signal: dict[str, Any]) -> Opinion:
+        """Run the detection pipeline and turn its verdict into a consensus Opinion."""
+
+        outcome = self.pipeline.run(
+            correlation_id=case["case_id"],
+            source_agent=self.agent_id,
+            signal=signal,
+            context=case,
+        )
+        ev = outcome.evaluation
+        return Opinion(
+            agent_id=self.agent_id,
+            severity=ev.severity,
+            confidence=ev.confidence,
+            domain=outcome.event.domain,
+            evidence_ref=ev.evidence_ref,
+            no_auto_resolve=ev.no_auto_resolve,
+            verdict=ev.verdict,
+            risk_score=ev.score,
+            rationale=tuple(ev.rationale),
+        )
+
+    def _preset_opinion(self, case: dict[str, Any]) -> list[Opinion]:
+        """Legacy path: surface a pre-set opinion spec if one is declared."""
+
+        spec = case.get("opinions", {}).get(self.agent_id)
         if spec is None:
             return []
         return [

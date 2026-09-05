@@ -5,9 +5,9 @@
 | **Project** | 463548B — Agentic AI Compliance Monitoring System |
 | **Client (fictional)** | Meridian Global Bank |
 | **Author** | Aman Singh (Zetheta intern) |
-| **Version** | 1.0.0 · **Date** 2026-08-21 |
-| **Deliverables** | D1–D7 design docs + runnable Python reference implementation |
-| **Status** | Complete — all 20 scenarios reproduced, 43 tests passing, audit chain tamper-evident |
+| **Version** | 1.1.0 · **Date** 2026-09-05 |
+| **Deliverables** | D1–D7 design docs + D8 detection-core extension + runnable Python reference implementation |
+| **Status** | Complete — all 20 scenarios reproduced, 99 tests passing, audit chain tamper-evident |
 
 ---
 
@@ -33,8 +33,10 @@ flowchart LR
     TM & CS & RU & CE & EM & RG -.->|every step| AL[(Audit Ledger<br/>hash-chained, WORM)]
     EM -->|tier T0–T4| HUMAN[Human reviewer /<br/>Legal / Board]
 ```
-//this was a lot
+
 The pipeline for one case is always the same six steps: **ingest → route → detect → reach consensus → escalate → report**, with **every** step written to the append-only audit ledger. Because the path is identical for all 20 scenarios, the behaviour is reproducible and the audit trail is complete by construction.
+
+The **detect** step is itself a **two-tier detection core** (D8, `src/detection/`): each agent *computes* its opinion from the raw signal rather than replaying a fixed value — a normalization pipe standardises the input, deterministic guardrails apply zero-latency bright-line checks, and an agentic evaluator (with pluggable, deterministic-by-default backend) emits a structured verdict (`PASS`/`FLAGGED`/`VIOLATION`), a 0–100 risk score, and a Chain-of-Thought. After escalation, a **human-in-the-loop router** sends high-risk or low-confidence cases to the right human queue. This is additive: opinions are computed to reproduce the same locked outcomes exactly (`confidence = risk-score / 100`), so consensus, escalation and audit behaviour are unchanged. See `docs/detection/detection-core.md`.
 
 ## 3. The agents and coordination components
 
@@ -79,10 +81,11 @@ The routing **tier** is then `tier = max(confidence-band tier, severity-floor ti
 | **D5 — Agent specs** | `docs/agents/` | one spec per agent + `capability-matrix.md` |
 | **D6 — Scenario trace-throughs** | `tests/scenarios/` | `CS-01.md … CS-20.md` + `scenario-summary.md` (the locked expected outcomes) |
 | **D7 — Observability** | `docs/observability/` | `logging-spec.md`, `monitoring-dashboard.md`, `audit-trail.md`, `retention-policy.md` |
-| **Reference implementation** | `src/` | Agents, orchestrator, consensus, escalation, audit, and `run_demo.py` |
-| **Tests** | `tests/` | `test_scenarios.py`, `test_consensus.py`, `test_audit.py` |
+| **D8 — Detection core** (extension) | `docs/detection/` | `detection-core.md` — ingestion/normalization, deterministic guardrails, agentic evaluator, HITL routing |
+| **Reference implementation** | `src/` | Agents, orchestrator, consensus, escalation, audit, `run_demo.py`, and the `detection/` package (normalization, guardrails, evaluator, hitl) |
+| **Tests** | `tests/` | `test_scenarios.py`, `test_consensus.py`, `test_audit.py`, `test_detection.py` |
 
-**Suggested reading order for a reviewer:** this README → `docs/architecture/system-topology.md` → `docs/conflict-resolution/consensus-algorithm.md` → `docs/escalation/escalation-framework.md` → run the demo (§6) → `tests/scenarios/scenario-summary.md`.
+**Suggested reading order for a reviewer:** this README → `docs/architecture/system-topology.md` → `docs/detection/detection-core.md` → `docs/conflict-resolution/consensus-algorithm.md` → `docs/escalation/escalation-framework.md` → run the demo (§6) → `tests/scenarios/scenario-summary.md`.
 
 ## 6. Running the reference implementation
 
@@ -93,11 +96,11 @@ The routing **tier** is then `tier = max(confidence-band tier, severity-floor ti
 python -m src.run_demo        # runs all 20 scenarios + audit tamper-evidence demo
 ```
 
-Expected result: a table of all 20 scenarios, `20/20 matched the locked expected outcomes`, then a three-line audit demonstration showing the intact chain verifies, a deliberate tamper is *detected*, and restoring the entry re-verifies — ending in `ALL CHECKS PASSED`.
+Expected result: a table of all 20 scenarios (each row now also showing the case's computed detection verdict and where it was routed), `20/20 matched the locked expected outcomes`; then a **worked example of the two-tier detection core** on one signal (the deterministic pass, the evaluator's tool calls, the risk score, and the full Chain-of-Thought); then the **human-in-the-loop review queue** the run produced; then a three-line audit demonstration showing the intact chain verifies, a deliberate tamper is *detected*, and restoring the entry re-verifies — ending in `ALL CHECKS PASSED` (157 audit entries across all cases).
 
 ```bash
 pip install pytest            # only dependency, only needed for the test suite
-pytest -q                     # 43 tests: 23 scenario + 8 audit + 12 consensus
+pytest -q                     # 99 tests: 23 scenario + 12 consensus + 8 audit + 56 detection
 ```
 
 Every scenario's expected outcome lives in exactly one place — `src/scenarios.py` — and is shared by both the demo and the tests, so the trace-through docs (`tests/scenarios/`) and the code cannot silently drift apart.
@@ -112,6 +115,8 @@ The brief left the framework open ("choose and justify"). **I deliberately did *
 - **Zero heavy dependencies → auditable and portable.** A pure-stdlib implementation has no supply-chain surface, runs anywhere with Python 3.10+, and every line can be explained in a viva. This directly serves the assessment's "implementation-ready, unambiguous" standard.
 
 **Where ML *does* belong.** This separation is intentional, not a rejection of ML. In production the **detection layer** — NLP for communications intent, pattern/anomaly models for trading — would absolutely use machine learning, and each agent's spec (`docs/agents/`) describes those methods. What stays deterministic is the **coordination layer**: how opinions are combined, how cases are escalated, and how everything is recorded. ML proposes; the deterministic layer disposes and documents.
+
+The **detection core (D8)** makes this concrete: its agentic evaluator scores through a pluggable `EvaluatorBackend`. The default `DeterministicBackend` is a transparent scorecard (so the graded system stays offline and reproducible), while `LLMBackend` shows exactly how a real model would slot in — structured JSON out — but is deliberately inert on the default path (it raises unless a client is injected). A model can therefore be swapped into detection without touching, or destabilising, the deterministic decision layer.
 
 ## 8. India regulatory coverage
 
@@ -152,15 +157,11 @@ The assessment states it contains deliberately planted errors and awards **5 bon
 
 ## 10. AI tools used
 
-Per the assessment's disclosure requirement, this submission was produced with AI assistance (Anthropic Claude, Opus 4.x, operating as an agent in the Claude desktop app). AI was used to: draft and structure the design documents, implement the pure-Python reference code and tests, cross-check the 20 scenario outcomes, and help identify candidate specification errors for §9. **All regulatory citations, the consensus mathematics, the scenario outcomes, and the error report were reviewed for accuracy against the specification and the author's own understanding, and are the author's responsibility.** The code is deliberately kept readable and heavily commented so that the author can explain every component in a viva; no black-box or generated-but-unexplained logic is included. AI-generated diagrams (Mermaid) were reviewed against the diagram standards in the brief.
+Per the assessment's disclosure requirement, this submission was produced with AI assistance (Anthropic Claude, Opus 4.x, operating as an agent in the Claude desktop app). AI was used to: draft and structure the design documents, implement the pure-Python reference code and tests (including the D8 two-tier detection core — ingestion/normalization, deterministic guardrails, the pluggable agentic evaluator, and HITL routing), cross-check the 20 scenario outcomes, and help identify candidate specification errors for §9. **All regulatory citations, the consensus mathematics, the scenario outcomes, and the error report were reviewed for accuracy against the specification and the author's own understanding, and are the author's responsibility.** The code is deliberately kept readable and heavily commented so that the author can explain every component in a viva; no black-box or generated-but-unexplained logic is included. AI-generated diagrams (Mermaid) were reviewed against the diagram standards in the brief.
 
 ## 11. Assessment traceability
 
 See `SELF-ASSESSMENT.md` for a section-by-section mapping of deliverables to the rubric, the badge claims (including the "Error Spotter" badge earned via §9), and known scope decisions (Core Pass/Merit scope: all required deliverables present and correct, the four required agents, all 20 scenarios traced, plus a runnable reference implementation).
 
 ---
-*End of README v1.0.0*
-#   C o m p l i a n c e - M o n i t o r i n g - S y s t e m  
- #   C o m p l i a n c e - M o n i t o r i n g - S y s t e m  
- #   C o m p l i a n c e - M o n i t o r i n g - S y s t e m  
- 
+*End of README v1.1.0*

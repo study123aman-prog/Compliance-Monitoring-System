@@ -4,17 +4,24 @@ run_demo.py — run all 20 scenarios end to end and print what happened.
     python -m src.run_demo
 
 It drives every scenario through a single Orchestrator (so the audit trail forms
-one continuous hash chain), prints a results table with a PASS/FAIL check against
-the locked expected outcomes, then:
-  1. verifies the whole audit chain, and
-  2. demonstrates tamper-evidence by mutating one entry and re-verifying.
+one continuous hash chain), then shows four things:
+
+  1. a results table with a PASS/FAIL check against the locked expected outcomes,
+     now including each case's detection verdict and where it was routed;
+  2. a worked example of the two-tier detection core on one signal — the
+     deterministic first pass, the agentic evaluator's tool calls, the risk score,
+     and the full Chain-of-Thought — to make the "compute, don't replay" path
+     visible;
+  3. the Human-in-the-Loop review queue the run produced; and
+  4. audit-chain verification plus a tamper-evidence demonstration.
 
 No third-party dependencies — standard library only.
 """
 from __future__ import annotations
 
+from .detection import DetectionPipeline
 from .orchestrator import CaseOutcome, Orchestrator
-from .scenarios import SCENARIOS
+from .scenarios import SCENARIOS, by_id
 
 
 # Fields in `expected` that map onto the escalation result (default False if absent).
@@ -49,12 +56,73 @@ def check(outcome: CaseOutcome, expected: dict) -> list[str]:
     return problems
 
 
-def _row(case_id: str, title: str, outcome: CaseOutcome, ok: bool) -> str:
+def _verdicts(outcome: CaseOutcome) -> str:
+    """Compact per-agent detection verdicts (PASS/FLAGGED/VIOLATION) for a case."""
+
+    labels = {"VIOLATION": "V", "FLAGGED": "F", "PASS": "P"}
+    tags = [labels.get(o.verdict, "-") for o in outcome.opinions if not o.benign and o.verdict]
+    return "".join(tags) or "-"
+
+
+def _route(outcome: CaseOutcome) -> str:
+    """Where the HITL router sent the case (or how it was auto-dispositioned)."""
+
+    if outcome.review is not None:
+        return f"P{outcome.review.priority} {outcome.review.queue}"
+    return "auto-cleared" if outcome.consensus.suppressed else "auto-passed"
+
+
+def _row(case_id: str, outcome: CaseOutcome, ok: bool) -> str:
     cr, er = outcome.consensus, outcome.escalation
     disp = "SUPPRESSED" if cr.suppressed else cr.severity.name
     flag = "OK " if ok else "XX "
     return (f"{flag} {case_id:<6} {disp:<10} c={cr.confidence:<4} {er.tier.name:<3} "
-            f"{cr.mechanism:<28} {title[:44]}")
+            f"{_verdicts(outcome):<4} {_route(outcome)[:46]}")
+
+
+def _print_detection_example(case_id: str, agent_id: str) -> None:
+    """Show the full two-tier detection output for one signal (transparency)."""
+
+    scenario = by_id(case_id)
+    signal = scenario["signals"][agent_id]
+    outcome = DetectionPipeline().run(
+        correlation_id=case_id, source_agent=agent_id, signal=signal, context=scenario)
+    ev = outcome.evaluation
+
+    print("=" * 108)
+    print(f"DETECTION CORE — worked example: {case_id} / {agent_id}")
+    print("=" * 108)
+    print(f"  violation candidate : {outcome.event.violation_candidate}")
+    print(f"  normalized event id : {outcome.event.event_id}  (schema {outcome.event.schema_version})")
+    print(f"  deterministic pass  : {outcome.guardrails.points} pts from "
+          f"{len(outcome.guardrails.hits)} bright-line hit(s)"
+          f"{' [HARD STOP]' if outcome.guardrails.hard else ''}")
+    print(f"  evaluator tools     :")
+    for t in ev.tool_trace:
+        print(f"      - {t}")
+    print(f"  structured verdict  : {ev.verdict}  score={ev.score}/100  "
+          f"confidence={ev.confidence:.2f}  severity={ev.severity.name}")
+    print("  chain-of-thought    :")
+    for line in ev.rationale:
+        print(f"      {line}")
+    print()
+
+
+def _print_hitl_queue(orch: Orchestrator) -> None:
+    """Print the human-review queue the run produced, most urgent first."""
+
+    print("=" * 108)
+    print("HUMAN-IN-THE-LOOP — review queue produced by this run")
+    print("=" * 108)
+    print(f"  {'case':<6} {'pri':<4} {'tier':<4} {'severity':<9} {'conf':<6} queue / reasons")
+    print("-" * 108)
+    for it in orch.hitl.pending():
+        print(f"  {it.case_id:<6} P{it.priority:<3} {it.tier:<4} {it.severity:<9} "
+              f"{it.confidence:<6} {it.queue}")
+        print(f"         reasons: {'; '.join(it.reasons)}")
+    print("-" * 108)
+    print(f"  {orch.hitl.summary()}")
+    print()
 
 
 def main() -> int:
@@ -63,7 +131,11 @@ def main() -> int:
     print("=" * 108)
     print("MULTI-AGENT COMPLIANCE MONITORING SYSTEM — reference demo (all 20 scenarios)")
     print("=" * 108)
-    print(f"    {'case':<6} {'disposition':<10} {'conf':<6} {'tier':<4} {'mechanism':<28} title")
+    print("  opinions are COMPUTED from raw signals by the two-tier detection core "
+          "(normalize -> guardrails -> evaluator);")
+    print("  verdict column: V=VIOLATION F=FLAGGED P=PASS per voting agent.")
+    print("-" * 108)
+    print(f"    {'case':<6} {'disposition':<10} {'conf':<6} {'tier':<4} {'vd':<4} routed to")
     print("-" * 108)
 
     failures = 0
@@ -72,15 +144,20 @@ def main() -> int:
         problems = check(outcome, scenario["expected"])
         ok = not problems
         failures += 0 if ok else 1
-        print(_row(scenario["case_id"], scenario["title"], outcome, ok))
+        print(_row(scenario["case_id"], outcome, ok))
         if problems:
             print(f"        -> MISMATCH: {'; '.join(problems)}")
 
     print("-" * 108)
     print(f"scenario results: {len(SCENARIOS) - failures}/{len(SCENARIOS)} matched the locked expected outcomes")
+    print()
+
+    # ---- Worked detection example + the HITL queue this run produced. ----
+    _print_detection_example("CS-01", "agent.transaction_monitor")
+    _print_hitl_queue(orch)
 
     # ---- Audit chain: verify, then demonstrate tamper-evidence. ----
-    print("\n" + "=" * 108)
+    print("=" * 108)
     print("AUDIT TRAIL — tamper-evidence demonstration")
     print("=" * 108)
     entries = orch.audit.entries

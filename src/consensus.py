@@ -53,6 +53,13 @@ class Opinion:
     weight: float | None = None
     #: True for a jurisdictional (C5) conflict that must NOT be auto-resolved.
     no_auto_resolve: bool = False
+    #: --- detection-core provenance (populated when the opinion is COMPUTED by the
+    #: two-tier detection pipeline rather than supplied as a pre-set spec). These are
+    #: purely informational — they do not affect the consensus math — but they let
+    #: the audit trail and the HITL router see *why* the agent reached its score.
+    verdict: str = ""                       # PASS | FLAGGED | VIOLATION ("" if unset)
+    risk_score: int = 0                     # 0..100; confidence == risk_score/100
+    rationale: tuple[str, ...] = ()         # the evaluator's Chain-of-Thought
 
     def effective_weight(self) -> float:
         """a_i — the Dempster-Shafer discounting factor. Uses the explicit weight

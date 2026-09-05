@@ -38,6 +38,15 @@ The hard parts, which the design specifically addresses:
 - **Escalation Manager** — turns the result into a **tier** (T0–T4), an SLA clock, and a decision-support package for a human.
 - **Audit Ledger** — a hash-chained, append-only log of every event (Section 6).
 
+**How each agent forms its opinion — the two-tier detection core.** An agent does not carry a hard-coded verdict; it *computes* one from the raw evidence through a small, inspectable pipeline (`src/detection/`, spec in `docs/detection/detection-core.md`). Say it as: *"the agents compute, they don't replay."* Four stages:
+
+1. **Normalize** — turn a heterogeneous raw signal (a trade, a chat, a rule change) into one canonical "unified audit payload" so every later stage sees the same shape.
+2. **Deterministic first pass (guardrails)** — fast, zero-latency bright-line checks that need no model: is the counterparty on the OFAC list? are the deposits all just under $10k? These are microsecond-cheap, they run first, and some are **hard stops** (a sanctions match is a violation on its own and can't be "reasoned away").
+3. **Agentic evaluator** — answers the judgement question: it calls two tools — *query policy docs* (maps the violation type to its inherent severity + rules) and *inspect session context* (corroborating signals on the same case) — then emits a structured verdict **PASS / FLAGGED / VIOLATION**, a **0–100 risk score**, and a **Chain-of-Thought** listing every point of evidence. Confidence is simply `score / 100`.
+4. **Human-in-the-loop (HITL) router** — after consensus/escalation, routes high-risk or low-confidence cases to the right human queue (Section 5).
+
+The key viva point: this is **deterministic and reproducible**. The evaluator's scoring backend is *pluggable* — the default is a transparent scorecard (no model, no randomness), and a real LLM is a documented drop-in that is deliberately inert unless you inject a client, so it never sits on the graded path. That is how the agents can "compute" their opinions and still reproduce all 20 locked outcomes exactly.
+
 > **Naming trap an examiner may test you on:** the agent "CS" (Communication Scanner) is *not* the same as the scenario IDs "CS-01…CS-20", where "CS" is just the assessment's scenario prefix. I documented this explicitly.
 
 ## 3. End-to-end flow of one case (walk through CS-01)
@@ -45,7 +54,7 @@ The hard parts, which the design specifically addresses:
 CS-01 is insider trading: a portfolio manager accumulates a stock over three weeks; internal emails show he had dinner with the target company's CFO; the stock jumps 35% on an acquisition announcement two days later.
 
 1. **Ingest & route.** The trade pattern arrives on `transactions` → Orchestrator routes to **TM**. The email linkage arrives on `communications` → routed to **CS**. They share a `correlation_id` so the system knows they're about the same case.
-2. **Detect.** TM assesses the accumulation-before-announcement pattern → opinion: **HIGH, confidence 0.72**, domain *trading*. CS assesses the dinner email → opinion: **HIGH, confidence 0.80**, domain *communications*.
+2. **Detect (two-tier detection core).** Each agent *computes* its opinion from the raw signal — it does not replay a stored number. TM's raw trade signal runs through the core: **(1) normalize** it into a canonical payload; **(2) deterministic guardrails** apply bright-line checks — the instrument `ACME` is on the restricted list (+24) and the buy is inside the 21-day pre-announcement window (17 days, +20); **(3) the agentic evaluator** looks up policy (`insider_trading → HIGH`), adds the contextual "4.1× ADV accumulation" indicator (+28), and inspects the case for corroborating siblings. Score `44 + 28 = 72/100` → confidence **0.72**, verdict **FLAGGED**, severity **HIGH** (domain *trading*). CS's dinner-email signal runs the same way → **HIGH, confidence 0.80**, domain *communications*. Because `confidence = risk-score / 100` and severity comes from the policy table, these computed opinions land exactly on the locked values.
 3. **Consensus.** Two agents, severities agree (both HIGH), so the engine uses **Dempster–Shafer combination** (corroboration). The two independent signals combine into **CRITICAL @ 0.92** (worked math in Section 4).
 4. **Escalate.** CRITICAL → severity floor T4; confidence 0.92 → band T4; `tier = max(T4, T4) = T4`. This is an insider-trading/SAR matter, so the SAR trigger also forces T4 and starts the 24-hour clock. A decision-support package (both opinions, the evidence refs, the consensus math) is assembled for a Director-level human.
 5. **Report.** RG builds the case report.
@@ -94,11 +103,13 @@ Two ideas, both "raise-only" for safety:
 
 Only a case that is low-severity **and** low-confidence **and** trigger-free lands at T0 — and even then it's *auto-closed with written reasoning and an audit entry*, never silently dropped.
 
+**Who actually receives the case — the HITL router.** The tier says *how urgent*; the human-in-the-loop router (detection stage 4) says *which desk*. It sends a case to a human when it is **high-risk** (tier T3/T4, or a special obligation is attached — transaction hold, dual control, board reporting, legal, or an unresolved conflict) **or low-confidence** (confidence in the ambiguous 0.30–0.75 band, or any agent returned FLAGGED). It then picks the queue — Legal & Compliance Review Board (legal/unresolved), Board Risk Committee (board reporting), Senior Compliance Officer (transaction hold or CRITICAL), or a Compliance Analyst (HIGH / everything else) — at a priority of `5 − tier`. A suppressed false positive (CS-18) is **auto-cleared**, and a genuinely low-risk case is **auto-passed** — both *recorded* in the audit trail, never silently dropped. Across the 20 scenarios: 19 go to a human, 1 (CS-18) is auto-cleared, 0 auto-passed.
+
 ## 6. Why the audit trail can't be faked (tamper-evidence)
 
 Each ledger entry stores the previous entry's hash plus its own content, and computes `entry_hash = SHA-256(prev_hash ‖ sequence ‖ payload)`. This chains the entries like a blockchain: if anyone edits a past entry, its hash changes, which breaks the `prev_hash` link of every entry after it — so verification instantly detects *where* the tampering happened. Entries are also signed (I used HMAC-SHA256 as an **honestly-documented stand-in** for ECDSA P-256 — the chaining is real; only the signature primitive is simplified so the demo needs no external libraries). The ledger is **append-only (WORM)**, which satisfies the intent of **SEC Rule 17a-4(f)**.
 
-The demo proves this live: it verifies the 109-entry chain (True), mutates one entry (verification → False, and it names the exact sequence number), then restores it (True again).
+The demo proves this live: it verifies the 157-entry chain (True), mutates one entry (verification → False, and it names the exact sequence number), then restores it (True again). (The chain grew from 109 to 157 entries once the detection core began writing a `detection.evaluated` record — the structured verdict and Chain-of-Thought — plus a HITL routing record for every case.)
 
 ## 7. Why I built it this way (technology justification)
 
@@ -130,7 +141,10 @@ The four you should be ready to walk through in detail: **CS-01** (corroboration
 - **"How is a false positive different from a miss?"** A false positive (CS-18) is suppressed *only* with an authenticated benign verification and a written audit reason; absence of evidence never suppresses a critical alert.
 - **"Prove the log can't be tampered with."** Run the demo — it detects a single mutated entry by breaking the hash chain and reports the exact sequence number.
 - **"Why not use an LLM agent framework?"** Determinism, explainability, auditability, and zero dependencies — all legal requirements for surveillance, none guaranteed by a stochastic framework.
-- **"Where would real ML go?"** In detection (NLP, anomaly detection), not in the decision/consensus layer.
+- **"Where would real ML go?"** In detection (NLP, anomaly detection), not in the decision/consensus layer. Concretely, it slots behind the evaluator's pluggable backend without touching consensus/escalation/audit.
+- **"How does an agent actually decide its opinion?"** Through the two-tier detection core: normalize the raw signal, run deterministic bright-line guardrails, then an agentic evaluator that queries policy + inspects context and outputs a PASS/FLAGGED/VIOLATION verdict with a 0–100 score and a Chain-of-Thought. Confidence = score / 100.
+- **"If the agents now *compute* opinions, how is it still deterministic and reproducible?"** The default evaluator backend is a transparent scorecard with no model and no randomness; the LLM backend is a documented drop-in that stays inert unless a client is injected, so it never sits on the graded path. Same signal → same verdict, and every one of the 20 locked outcomes is reproduced exactly (verified by `tests/test_detection.py`).
+- **"What's a hard stop?"** A bright-line guardrail hit — e.g. a confirmed OFAC sanctions match or sub-$10k structuring — that is a violation on its own and must never be reasoned away by the evaluator. It's flagged in the Chain-of-Thought as `[hard-stop]`.
 - **"Did you find errors in the spec?"** Yes — five, documented in the README with corrections and citations (e.g., Section A2.1 says "three" primary topologies but lists four; Part C says "four" case studies but presents five; CS-05 cites the wrong MiFID II article for information barriers).
 
 ---

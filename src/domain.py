@@ -78,6 +78,7 @@ AGENT_ORCH = "agent.orchestrator"
 SVC_CONSENSUS = "service.consensus_engine"
 SVC_ESCALATION = "service.escalation_manager"
 SVC_AUDIT = "service.audit_ledger"
+SVC_HITL = "service.hitl_router"          # human-in-the-loop review router
 
 
 # --- Domain-authority matrix (consensus-algorithm.md §3) --------------------
